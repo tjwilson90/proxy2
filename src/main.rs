@@ -2,8 +2,8 @@ use base64::engine::DEFAULT_ENGINE;
 use base64::write::EncoderWriter;
 use http_body::Empty;
 use hyper::body::{aggregate, Buf, Bytes};
-use hyper::header::{HeaderName, HeaderValue};
-use hyper::{Client, HeaderMap, Method, Uri};
+use hyper::header::{HeaderName, HeaderValue, LOCATION};
+use hyper::{Body, Client, HeaderMap, Method, Response, Uri};
 use hyper_tls::HttpsConnector;
 use lambda_runtime::{run, service_fn, LambdaEvent};
 use serde::de::MapAccess;
@@ -13,25 +13,43 @@ use std::{fmt, io};
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
-    run(service_fn(handler)).await?;
-    Ok(())
+    run(service_fn(handler)).await
 }
 
 async fn handler(event: LambdaEvent<Request>) -> Result<String, lambda_runtime::Error> {
-    let (req, _) = event.into_parts();
-
-    let mut builder = hyper::Request::builder().method(req.method).uri(req.uri);
-    *builder.headers_mut().unwrap() = req.headers;
-    let request = builder.body(Empty::<Bytes>::new())?;
-
-    let client = Client::builder().build(HttpsConnector::new());
-    let resp = client.request(request).await?;
-    let bytes = aggregate(resp.into_body()).await?;
-    let cap = (2 + 4 * bytes.remaining()) / 3;
+    let (request, _) = event.into_parts();
+    let response = fetch(request.method, request.uri, request.headers).await?;
+    let bytes = aggregate(response.into_body()).await?;
+    let mut writer = EncoderWriter::from(
+        Vec::with_capacity(base64::encoded_len(bytes.remaining(), true).unwrap()),
+        &DEFAULT_ENGINE,
+    );
     let mut reader = bytes.reader();
-    let mut writer = EncoderWriter::from(Vec::with_capacity(cap), &DEFAULT_ENGINE);
     io::copy(&mut reader, &mut writer)?;
-    Ok(unsafe { String::from_utf8_unchecked(writer.into_inner()) })
+    Ok(unsafe { String::from_utf8_unchecked(writer.finish()?) })
+}
+
+async fn fetch(
+    method: Method,
+    mut uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response<Body>, lambda_runtime::Error> {
+    let client = Client::builder().build(HttpsConnector::new());
+    for i in 0.. {
+        let mut builder = hyper::Request::builder().method(method.clone()).uri(uri);
+        *builder.headers_mut().unwrap() = headers.clone();
+        let request = builder.body(Empty::<Bytes>::new())?;
+
+        let response = client.request(request).await?;
+        if i < 10 && response.status().is_redirection() {
+            if let Some(location) = response.headers().get(LOCATION) {
+                uri = Uri::try_from(location.as_bytes())?;
+                continue;
+            }
+        }
+        return Ok(response);
+    }
+    unreachable!();
 }
 
 #[derive(Deserialize)]
