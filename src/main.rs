@@ -1,28 +1,67 @@
-use base64::engine::DEFAULT_ENGINE;
+use base64::engine::general_purpose::STANDARD;
 use base64::write::EncoderWriter;
 use http_body::Empty;
 use hyper::body::{aggregate, Buf, Bytes};
+use hyper::client::HttpConnector;
 use hyper::header::{HeaderName, HeaderValue, LOCATION};
 use hyper::{Body, Client, HeaderMap, Method, Response, Uri};
+use hyper_tls::native_tls::TlsConnector;
 use hyper_tls::HttpsConnector;
-use lambda_runtime::{run, service_fn, LambdaEvent};
+use lambda_runtime::{run, LambdaEvent, Service};
 use serde::de::MapAccess;
 use serde::{de, Deserialize, Deserializer};
+use std::future::Future;
 use std::str::FromStr;
+use std::task::{Context, Poll};
 use std::{fmt, io};
+
+type C = Client<HttpsConnector<HttpConnector>, Empty<Bytes>>;
+
+#[derive(Clone)]
+struct S<T> {
+    client: C,
+    handler: T,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
-    run(service_fn(handler)).await
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let tls = TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .unwrap();
+    let https = HttpsConnector::from((http, tls.into()));
+    let client = Client::builder().build(https);
+    run(S { client, handler }).await
 }
 
-async fn handler(event: LambdaEvent<Request>) -> Result<String, lambda_runtime::Error> {
+impl<T, F> Service<LambdaEvent<Request>> for S<T>
+where
+    T: FnMut(C, LambdaEvent<Request>) -> F,
+    F: Future<Output = Result<String, lambda_runtime::Error>>,
+{
+    type Response = String;
+    type Error = lambda_runtime::Error;
+    type Future = F;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: LambdaEvent<Request>) -> Self::Future {
+        (self.handler)(self.client.clone(), req)
+    }
+}
+
+async fn handler(client: C, event: LambdaEvent<Request>) -> Result<String, lambda_runtime::Error> {
     let (request, _) = event.into_parts();
-    let response = fetch(request.method, request.uri, request.headers).await?;
+    let response = fetch(&client, request.method, request.uri, request.headers).await?;
     let bytes = aggregate(response.into_body()).await?;
-    let mut writer = EncoderWriter::from(
+    let mut writer = EncoderWriter::new(
         Vec::with_capacity(base64::encoded_len(bytes.remaining(), true).unwrap()),
-        &DEFAULT_ENGINE,
+        &STANDARD,
     );
     let mut reader = bytes.reader();
     io::copy(&mut reader, &mut writer)?;
@@ -30,11 +69,11 @@ async fn handler(event: LambdaEvent<Request>) -> Result<String, lambda_runtime::
 }
 
 async fn fetch(
+    client: &C,
     method: Method,
     mut uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response<Body>, lambda_runtime::Error> {
-    let client = Client::builder().build(HttpsConnector::new());
     for i in 0.. {
         let mut builder = hyper::Request::builder().method(method.clone()).uri(uri);
         *builder.headers_mut().unwrap() = headers.clone();
