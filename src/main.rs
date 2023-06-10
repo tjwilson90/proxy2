@@ -7,21 +7,13 @@ use hyper::header::{HeaderName, HeaderValue, LOCATION};
 use hyper::{Body, Client, HeaderMap, Method, Response, Uri};
 use hyper_tls::native_tls::TlsConnector;
 use hyper_tls::HttpsConnector;
-use lambda_runtime::{run, LambdaEvent, Service};
+use lambda_runtime::{run, service_fn, LambdaEvent};
 use serde::de::MapAccess;
 use serde::{de, Deserialize, Deserializer};
-use std::future::Future;
 use std::str::FromStr;
-use std::task::{Context, Poll};
 use std::{fmt, io};
 
 type C = Client<HttpsConnector<HttpConnector>, Empty<Bytes>>;
-
-#[derive(Clone)]
-struct S<T> {
-    client: C,
-    handler: T,
-}
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
@@ -34,30 +26,12 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         .unwrap();
     let https = HttpsConnector::from((http, tls.into()));
     let client = Client::builder().build(https);
-    run(S { client, handler }).await
+    run(service_fn(|e| handler(&client, e))).await
 }
 
-impl<T, F> Service<LambdaEvent<Request>> for S<T>
-where
-    T: FnMut(C, LambdaEvent<Request>) -> F,
-    F: Future<Output = Result<String, lambda_runtime::Error>>,
-{
-    type Response = String;
-    type Error = lambda_runtime::Error;
-    type Future = F;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: LambdaEvent<Request>) -> Self::Future {
-        (self.handler)(self.client.clone(), req)
-    }
-}
-
-async fn handler(client: C, event: LambdaEvent<Request>) -> Result<String, lambda_runtime::Error> {
+async fn handler(client: &C, event: LambdaEvent<Request>) -> Result<String, lambda_runtime::Error> {
     let (request, _) = event.into_parts();
-    let response = fetch(&client, request.method, request.uri, request.headers).await?;
+    let response = fetch(client, request.method, request.uri, request.headers).await?;
     let bytes = aggregate(response.into_body()).await?;
     let mut writer = EncoderWriter::new(
         Vec::with_capacity(base64::encoded_len(bytes.remaining(), true).unwrap()),
