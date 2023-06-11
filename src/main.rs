@@ -1,19 +1,25 @@
+use crate::cache::Cache;
+use crate::request::Request;
 use base64::engine::general_purpose::STANDARD;
 use base64::write::EncoderWriter;
 use http_body::Empty;
 use hyper::body::{aggregate, Buf, Bytes};
 use hyper::client::HttpConnector;
-use hyper::header::{HeaderName, HeaderValue, LOCATION};
-use hyper::{Body, Client, HeaderMap, Method, Response, Uri};
+use hyper::header::LOCATION;
+use hyper::{Body, Client, Uri};
 use hyper_tls::native_tls::TlsConnector;
 use hyper_tls::HttpsConnector;
 use lambda_runtime::{run, service_fn, LambdaEvent};
-use serde::de::MapAccess;
-use serde::{de, Deserialize, Deserializer};
-use std::str::FromStr;
-use std::{fmt, io};
+use serde::Serialize;
+use std::io;
+
+mod cache;
+mod request;
+
+const MAX_RESPONSE_LEN: usize = 6291456;
 
 type C = Client<HttpsConnector<HttpConnector>, Empty<Bytes>>;
+type HttpResponse = hyper::Response<Body>;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
@@ -26,12 +32,22 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         .unwrap();
     let https = HttpsConnector::from((http, tls.into()));
     let client = Client::builder().build(https);
-    run(service_fn(|e| handler(&client, e))).await
+    let cache = Cache::new();
+    run(service_fn(|e| handler(&client, &cache, e))).await
 }
 
-async fn handler(client: &C, event: LambdaEvent<Request>) -> Result<String, lambda_runtime::Error> {
+async fn handler(
+    client: &C,
+    cache: &Cache,
+    event: LambdaEvent<Request>,
+) -> Result<Response, lambda_runtime::Error> {
     let (request, _) = event.into_parts();
-    let response = fetch(client, request.method, request.uri, request.headers).await?;
+    if let Some(offset) = request.offset {
+        if let Some(data) = cache.remove(&request.uri) {
+            return Ok(slice_response(request.uri, data, offset, cache));
+        }
+    }
+    let response = fetch(client, &request).await?;
     let bytes = aggregate(response.into_body()).await?;
     let mut writer = EncoderWriter::new(
         Vec::with_capacity(base64::encoded_len(bytes.remaining(), true).unwrap()),
@@ -39,21 +55,25 @@ async fn handler(client: &C, event: LambdaEvent<Request>) -> Result<String, lamb
     );
     let mut reader = bytes.reader();
     io::copy(&mut reader, &mut writer)?;
-    Ok(unsafe { String::from_utf8_unchecked(writer.finish()?) })
+    let data = unsafe { String::from_utf8_unchecked(writer.finish()?) };
+    Ok(slice_response(
+        request.uri,
+        data,
+        request.offset.unwrap_or(0),
+        cache,
+    ))
 }
 
-async fn fetch(
-    client: &C,
-    method: Method,
-    mut uri: Uri,
-    headers: HeaderMap,
-) -> Result<Response<Body>, lambda_runtime::Error> {
+async fn fetch(client: &C, request: &Request) -> Result<HttpResponse, lambda_runtime::Error> {
+    let mut uri = request.uri.clone();
     for i in 0.. {
-        let mut builder = hyper::Request::builder().method(method.clone()).uri(uri);
-        *builder.headers_mut().unwrap() = headers.clone();
-        let request = builder.body(Empty::<Bytes>::new())?;
+        let mut builder = hyper::Request::builder()
+            .method(request.method.clone())
+            .uri(uri);
+        *builder.headers_mut().unwrap() = request.headers.clone();
+        let http_request = builder.body(Empty::<Bytes>::new())?;
 
-        let response = client.request(request).await?;
+        let response = client.request(http_request).await?;
         if i < 10 && response.status().is_redirection() {
             if let Some(location) = response.headers().get(LOCATION) {
                 uri = Uri::try_from(location.as_bytes())?;
@@ -65,74 +85,28 @@ async fn fetch(
     unreachable!();
 }
 
-#[derive(Deserialize)]
-struct Request {
-    #[serde(deserialize_with = "method")]
-    method: Method,
-    #[serde(deserialize_with = "uri")]
-    uri: Uri,
-    #[serde(default, deserialize_with = "headers")]
-    headers: HeaderMap,
+#[derive(Serialize)]
+pub struct Response {
+    pub data: String,
+    pub next: Option<usize>,
 }
 
-fn method<'de, D: Deserializer<'de>>(deser: D) -> Result<Method, D::Error> {
-    struct V;
-    impl<'de> de::Visitor<'de> for V {
-        type Value = Method;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("an http method")
+fn slice_response(uri: Uri, data: String, offset: usize, cache: &Cache) -> Response {
+    if offset + MAX_RESPONSE_LEN < data.len() {
+        let slice = data[offset..offset + MAX_RESPONSE_LEN].to_string();
+        cache.insert(uri, data);
+        Response {
+            data: slice,
+            next: Some(offset + MAX_RESPONSE_LEN),
         }
-
-        fn visit_borrowed_str<E: de::Error>(self, val: &'de str) -> Result<Self::Value, E> {
-            Method::from_str(val).map_err(de::Error::custom)
-        }
-
-        fn visit_string<E: de::Error>(self, val: String) -> Result<Self::Value, E> {
-            self.visit_borrowed_str(&val)
-        }
-    }
-    deser.deserialize_str(V)
-}
-
-fn uri<'de, D: Deserializer<'de>>(deser: D) -> Result<Uri, D::Error> {
-    struct V;
-    impl<'de> de::Visitor<'de> for V {
-        type Value = Uri;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("an http uri")
-        }
-
-        fn visit_borrowed_str<E: de::Error>(self, val: &'de str) -> Result<Self::Value, E> {
-            Uri::from_str(val).map_err(de::Error::custom)
-        }
-
-        fn visit_string<E: de::Error>(self, val: String) -> Result<Self::Value, E> {
-            self.visit_borrowed_str(&val)
+    } else {
+        Response {
+            data: if offset == 0 {
+                data
+            } else {
+                data[offset..].to_string()
+            },
+            next: None,
         }
     }
-    deser.deserialize_str(V)
-}
-
-fn headers<'de, D: Deserializer<'de>>(deser: D) -> Result<HeaderMap, D::Error> {
-    struct V;
-    impl<'de> de::Visitor<'de> for V {
-        type Value = HeaderMap;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("http headers")
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            let mut headers = HeaderMap::with_capacity(map.size_hint().unwrap_or(0));
-            while let Some((key, val)) = map.next_entry::<&'de str, &'de str>()? {
-                let key = HeaderName::from_str(key).map_err(de::Error::custom)?;
-                let val = HeaderValue::from_str(val).map_err(de::Error::custom)?;
-                headers.insert(key, val);
-            }
-            Ok(headers)
-        }
-    }
-    deser.deserialize_map(V)
 }
