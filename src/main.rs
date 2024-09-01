@@ -6,12 +6,13 @@ use http_body::Empty;
 use hyper::body::{aggregate, Buf, Bytes};
 use hyper::client::HttpConnector;
 use hyper::header::LOCATION;
-use hyper::{Body, Client, Uri};
+use hyper::{Body, Client};
 use hyper_tls::native_tls::TlsConnector;
 use hyper_tls::HttpsConnector;
 use lambda_runtime::{run, service_fn, LambdaEvent};
 use serde::Serialize;
 use std::io;
+use url::Url;
 
 mod cache;
 mod request;
@@ -44,10 +45,11 @@ async fn handler(
     let (request, _) = event.into_parts();
     if let Some(offset) = request.offset {
         if let Some(data) = cache.remove(&request.uri) {
-            return Ok(slice_response(request.uri, data, offset, cache));
+            return Ok(slice_response(200, request.uri, data, offset, cache));
         }
     }
     let response = fetch(client, &request).await?;
+    let status = response.status().as_u16();
     let bytes = aggregate(response.into_body()).await?;
     let mut writer = EncoderWriter::new(
         Vec::with_capacity(base64::encoded_len(bytes.remaining(), true).unwrap()),
@@ -57,6 +59,7 @@ async fn handler(
     io::copy(&mut reader, &mut writer)?;
     let data = unsafe { String::from_utf8_unchecked(writer.finish()?) };
     Ok(slice_response(
+        status,
         request.uri,
         data,
         request.offset.unwrap_or(0),
@@ -65,18 +68,18 @@ async fn handler(
 }
 
 async fn fetch(client: &C, request: &Request) -> Result<HttpResponse, lambda_runtime::Error> {
-    let mut uri = request.uri.clone();
+    let mut url = Url::parse(&request.uri)?;
     for i in 0.. {
         let mut builder = hyper::Request::builder()
             .method(request.method.clone())
-            .uri(uri);
+            .uri(url.to_string());
         *builder.headers_mut().unwrap() = request.headers.clone();
         let http_request = builder.body(Empty::<Bytes>::new())?;
 
         let response = client.request(http_request).await?;
         if i < 10 && response.status().is_redirection() {
             if let Some(location) = response.headers().get(LOCATION) {
-                uri = Uri::try_from(location.as_bytes())?;
+                url = url.join(location.to_str()?)?;
                 continue;
             }
         }
@@ -87,20 +90,23 @@ async fn fetch(client: &C, request: &Request) -> Result<HttpResponse, lambda_run
 
 #[derive(Serialize)]
 pub struct Response {
+    pub status: u16,
     pub data: String,
     pub next: Option<usize>,
 }
 
-fn slice_response(uri: Uri, data: String, offset: usize, cache: &Cache) -> Response {
+fn slice_response(status: u16, uri: String, data: String, offset: usize, cache: &Cache) -> Response {
     if offset + MAX_RESPONSE_LEN < data.len() {
         let slice = data[offset..offset + MAX_RESPONSE_LEN].to_string();
         cache.insert(uri, data);
         Response {
+            status,
             data: slice,
             next: Some(offset + MAX_RESPONSE_LEN),
         }
     } else {
         Response {
+            status,
             data: if offset == 0 {
                 data
             } else {

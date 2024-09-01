@@ -11,3 +11,4 @@ hyper-tls = {version = "0.5", features = ["vendored"] }
 lambda_runtime = "0.8"
 serde = "1.0"
 tokio = {version = "1.28", features = ["macros"] }
+url = "2.5.2"

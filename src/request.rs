@@ -1,5 +1,5 @@
 use hyper::header::{HeaderName, HeaderValue};
-use hyper::{HeaderMap, Method, Uri};
+use hyper::{HeaderMap, Method};
 use serde::de::MapAccess;
 use serde::{de, Deserialize, Deserializer};
 use std::fmt;
@@ -9,8 +9,7 @@ use std::str::FromStr;
 pub struct Request {
     #[serde(deserialize_with = "method")]
     pub method: Method,
-    #[serde(deserialize_with = "uri")]
-    pub uri: Uri,
+    pub uri: String,
     #[serde(default, deserialize_with = "headers")]
     pub headers: HeaderMap,
     pub offset: Option<usize>,
@@ -27,26 +26,6 @@ fn method<'de, D: Deserializer<'de>>(deser: D) -> Result<Method, D::Error> {
 
         fn visit_borrowed_str<E: de::Error>(self, val: &'de str) -> Result<Self::Value, E> {
             Method::from_str(val).map_err(de::Error::custom)
-        }
-
-        fn visit_string<E: de::Error>(self, val: String) -> Result<Self::Value, E> {
-            self.visit_borrowed_str(&val)
-        }
-    }
-    deser.deserialize_str(V)
-}
-
-fn uri<'de, D: Deserializer<'de>>(deser: D) -> Result<Uri, D::Error> {
-    struct V;
-    impl<'de> de::Visitor<'de> for V {
-        type Value = Uri;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("an http uri")
-        }
-
-        fn visit_borrowed_str<E: de::Error>(self, val: &'de str) -> Result<Self::Value, E> {
-            Uri::from_str(val).map_err(de::Error::custom)
         }
 
         fn visit_string<E: de::Error>(self, val: String) -> Result<Self::Value, E> {

@@ -1,9 +1,8 @@
-use hyper::Uri;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub struct Cache {
-    cache: Mutex<HashMap<Uri, String>>,
+    cache: Mutex<HashMap<String, String>>,
 }
 
 impl Cache {
@@ -13,12 +12,12 @@ impl Cache {
         }
     }
 
-    pub fn insert(&self, uri: Uri, response: String) {
+    pub fn insert(&self, uri: String, response: String) {
         let mut cache = self.cache.lock().unwrap();
         cache.insert(uri, response);
     }
 
-    pub fn remove(&self, uri: &Uri) -> Option<String> {
+    pub fn remove(&self, uri: &str) -> Option<String> {
         let mut cache = self.cache.lock().unwrap();
         cache.remove(uri)
     }
