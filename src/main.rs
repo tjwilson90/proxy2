@@ -1,9 +1,8 @@
-use crate::cache::Cache;
 use crate::request::Request;
 use base64::engine::general_purpose::STANDARD;
 use base64::write::EncoderWriter;
-use http_body::Empty;
-use hyper::body::{aggregate, Buf, Bytes};
+use http_body::{Body as _, Empty};
+use hyper::body::{Buf, Bytes};
 use hyper::client::HttpConnector;
 use hyper::header::LOCATION;
 use hyper::{Body, Client};
@@ -11,13 +10,13 @@ use hyper_tls::native_tls::TlsConnector;
 use hyper_tls::HttpsConnector;
 use lambda_runtime::{run, service_fn, LambdaEvent};
 use serde::Serialize;
+use tokio::pin;
 use std::io;
 use url::Url;
 
-mod cache;
 mod request;
 
-const MAX_RESPONSE_LEN: usize = 6291456;
+const CHUNK_SIZE: usize = 4 * 1024*1024;
 
 type C = Client<HttpsConnector<HttpConnector>, Empty<Bytes>>;
 type HttpResponse = hyper::Response<Body>;
@@ -33,38 +32,49 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         .unwrap();
     let https = HttpsConnector::from((http, tls.into()));
     let client = Client::builder().build(https);
-    let cache = Cache::new();
-    run(service_fn(|e| handler(&client, &cache, e))).await
+    run(service_fn(|e| handler(&client, e))).await
 }
 
 async fn handler(
     client: &C,
-    cache: &Cache,
     event: LambdaEvent<Request>,
 ) -> Result<Response, lambda_runtime::Error> {
     let (request, _) = event.into_parts();
-    if let Some(offset) = request.offset {
-        if let Some(data) = cache.remove(&request.uri) {
-            return Ok(slice_response(200, request.uri, data, offset, cache));
-        }
-    }
     let response = fetch(client, &request).await?;
     let status = response.status().as_u16();
-    let bytes = aggregate(response.into_body()).await?;
-    let mut writer = EncoderWriter::new(
-        Vec::with_capacity(base64::encoded_len(bytes.remaining(), true).unwrap()),
-        &STANDARD,
-    );
-    let mut reader = bytes.reader();
-    io::copy(&mut reader, &mut writer)?;
+    let body = response.into_body();
+    pin!(body);
+    let mut skip = request.offset.unwrap_or_default();
+    let mut take = CHUNK_SIZE;
+    let mut writer = EncoderWriter::new(Vec::new(), &STANDARD);
+    let mut has_more = false;
+    while let Some(buf) = body.data().await {
+        let mut buf = buf?;
+        if take == 0 && buf.has_remaining() {
+            has_more = true;
+            break;
+        }
+        if skip >= buf.remaining() {
+            skip -= buf.remaining();
+            continue;
+        }
+        if skip > 0 {
+            buf.advance(skip);
+            skip = 0;
+        }
+        if buf.remaining() > take {
+            buf.truncate(take);
+        }
+        take -= buf.remaining();
+        let mut reader = buf.reader();
+        io::copy(&mut reader, &mut writer)?;
+    }
     let data = unsafe { String::from_utf8_unchecked(writer.finish()?) };
-    Ok(slice_response(
+    Ok(Response {
         status,
-        request.uri,
         data,
-        request.offset.unwrap_or(0),
-        cache,
-    ))
+        next: if has_more { Some(request.offset.unwrap_or_default() + CHUNK_SIZE) } else { None },
+    })
 }
 
 async fn fetch(client: &C, request: &Request) -> Result<HttpResponse, lambda_runtime::Error> {
@@ -93,26 +103,4 @@ pub struct Response {
     pub status: u16,
     pub data: String,
     pub next: Option<usize>,
-}
-
-fn slice_response(status: u16, uri: String, data: String, offset: usize, cache: &Cache) -> Response {
-    if offset + MAX_RESPONSE_LEN < data.len() {
-        let slice = data[offset..offset + MAX_RESPONSE_LEN].to_string();
-        cache.insert(uri, data);
-        Response {
-            status,
-            data: slice,
-            next: Some(offset + MAX_RESPONSE_LEN),
-        }
-    } else {
-        Response {
-            status,
-            data: if offset == 0 {
-                data
-            } else {
-                data[offset..].to_string()
-            },
-            next: None,
-        }
-    }
 }
